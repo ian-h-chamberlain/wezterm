@@ -3,11 +3,14 @@ use chrono::prelude::*;
 use futures::FutureExt;
 use log::Level;
 use luahelper::ValuePrinter;
-use mlua::Value;
+use mlua::{HookTriggers, MetaMethod, Table, Value};
 use mux::termwiztermtab::TermWizTerminal;
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use termwiz::cell::{AttributeChange, CellAttributes, Intensity};
 use termwiz::color::AnsiColor;
 use termwiz::input::{InputEvent, KeyCode, KeyEvent};
@@ -121,11 +124,92 @@ impl LineEditorHost for LuaReplHost {
         let mut preview = vec![];
 
         if let Err(err) = fragment_to_expr_or_statement(&self.lua, line) {
-            preview.push(OutputElement::Text(err))
+            preview.push(OutputElement::Text(err));
         }
 
         preview
     }
+
+    fn complete(&self, line: &str, cursor_position: usize) -> Vec<CompletionCandidate> {
+        let mut result = Vec::new();
+
+        let Some(line) = line.get(..cursor_position) else {
+            return result;
+        };
+
+        let ident_begin = line
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        log::debug!("ident = {ident_begin}");
+
+        let (before, ident_prefix) = line.split_at(ident_begin);
+        let Some(expr) = before.strip_suffix(|c: char| c == '.' || c == ':') else {
+            // TBD: should this attempt to handle locals or anything else?
+            return table_key_completions(self.lua.globals(), ident_prefix, ident_begin);
+        };
+
+        let func = match self
+            .lua
+            .load(format!("return {expr};"))
+            .set_name("=repl")
+            .into_function()
+        {
+            Ok(func) => func,
+            Err(err) => {
+                log::warn!("failed to parse {expr:?}: {err:#?}");
+                return result;
+            }
+        };
+
+        // self.lua.set_hook(
+        //     HookTriggers {
+        //         on_calls: true,
+        //         ..Default::default()
+        //     },
+        //     // prevent side effects from evaluating any calls; just use known tables
+        //     // This could probably be relaxed for e.g. known __index like wezterm.action
+        //     |_lua, dbg| {
+        //         // we have to ignore the call we are about to make:
+        //         if dbg.names().name == Some(Cow::Borrowed("=repl")) {
+        //             Ok(())
+        //         } else {
+        //             Err(mlua::Error::external("repl completion"))
+        //         }
+        //     },
+        // );
+
+        // TODO: this only handles tables, maybe we can try to also deal with
+        // userdata? Especially e.g. `wezterm.action`, `window` seem helpful
+        // See https://github.com/mlua-rs/mlua/issues/462 for possible options
+        if let Ok(table) = func.call::<_, mlua::Table>(()) {
+            result = table_key_completions(table, ident_prefix, ident_begin);
+        } else if let Ok(mt) = func
+            .call::<_, mlua::AnyUserData>(())
+            .and_then(|ud| ud.get_metatable())
+        {
+            if let Ok(index) = mt.get::<mlua::Function>(MetaMethod::Index.name()) {
+                // do something to iterate over it
+            }
+        }
+
+        // self.lua.remove_hook();
+
+        result
+    }
+}
+
+fn table_key_completions(tbl: mlua::Table, prefix: &str, index: usize) -> Vec<CompletionCandidate> {
+    tbl.pairs::<String, Value>()
+        .filter_map(|pair| {
+            let (key, _) = pair.ok()?;
+            key.starts_with(prefix).then_some(CompletionCandidate {
+                range: index..(index + prefix.len()),
+                text: key,
+            })
+        })
+        .collect()
 }
 
 pub fn show_debug_overlay(
