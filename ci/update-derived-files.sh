@@ -54,3 +54,6 @@ for cmd in \
   fname="docs/examples/cmd-synopsis-wezterm-cli-${cmd}--help.txt"
   cargo run --example narrow $PWD/target/debug/wezterm cli $cmd --help | ./target/debug/strip-ansi-escapes | trim_file > $fname
 done
+
+# Generate Lua type definitions for configuration
+cargo run --bin gen-config-lua > assets/lua/wezterm/config.lua
